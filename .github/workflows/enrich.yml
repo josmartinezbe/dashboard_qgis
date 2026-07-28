@@ -1,0 +1,42 @@
+name: Enrich QGIS Dashboard export
+
+on:
+  push:
+    paths:
+      - "raw/**.html"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Find the most recently modified raw export
+        id: findfile
+        run: |
+          FILE=$(ls -t raw/*.html | head -n 1)
+          echo "Usando: $FILE"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Enrich dashboard
+        run: |
+          python3 scripts/enrich_dashboard.py "${{ steps.findfile.outputs.file }}" index.html
+
+      - name: Commit and push index.html
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git diff --cached --quiet && echo "Sin cambios en index.html" && exit 0
+          git commit -m "Auto-enrich dashboard from ${{ steps.findfile.outputs.file }}"
+          git push
