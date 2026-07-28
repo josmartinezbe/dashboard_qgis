@@ -1,4 +1,4 @@
-name: Enrich QGIS Dashboard export
+name: Enrich QGIS Dashboard exports
 
 on:
   push:
@@ -21,22 +21,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Find the most recently modified raw export
-        id: findfile
+      - name: Enrich every raw export into dashboards/
         run: |
-          FILE=$(ls -t raw/*.html | head -n 1)
-          echo "Usando: $FILE"
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          mkdir -p dashboards
+          for f in raw/*.html; do
+            name=$(basename "$f")
+            echo "Enriqueciendo $f -> dashboards/$name"
+            python3 scripts/enrich_dashboard.py "$f" "dashboards/$name"
+          done
 
-      - name: Enrich dashboard
+      - name: Rebuild the landing page (index.html)
         run: |
-          python3 scripts/enrich_dashboard.py "${{ steps.findfile.outputs.file }}" index.html
+          python3 scripts/generate_index.py dashboards/ index.html
 
-      - name: Commit and push index.html
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.html
-          git diff --cached --quiet && echo "Sin cambios en index.html" && exit 0
-          git commit -m "Auto-enrich dashboard from ${{ steps.findfile.outputs.file }}"
+          git add dashboards index.html
+          git diff --cached --quiet && echo "Sin cambios" && exit 0
+          git commit -m "Auto-enrich dashboards + actualiza índice"
           git push
