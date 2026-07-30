@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
 enrich_dashboard.py — aplica automáticamente a cualquier export del plugin
-QGIS Dashboards los 3 arreglos/mejoras que fuimos construyendo a mano:
+QGIS Dashboards los 4 arreglos/mejoras que fuimos construyendo a mano:
 
   1. FIX  connections mixto array/objeto -> TypeError que deja la página en blanco.
-  2. MEJORA colores por categoría en el mapa + leyenda funcional
-     (se auto-detecta el campo de categoría desde la config del primer Chart
-     o Category selector que encuentre; si no hay ninguno, se omite este paso).
+  2. MEJORA colores por categoría en el mapa + leyenda funcional (usa el color
+     real por feature si existe un campo tipo codigo_color; si no, genera
+     una paleta automática).
   3. MEJORA filtro por extensión: Chart/List/Indicator/Pivot se recalculan al
      hacer pan/zoom en el mapa, sin reconstruir el mapa (no pierdes tu posición).
+  4. MEJORA el propio mapa oculta/muestra polígonos según la selección activa
+     (Category selector, clic en una barra del Chart, etc.) -- antes el mapa
+     siempre dibujaba todos los polígonos sin importar el filtro.
 
 Uso:
     python3 enrich_dashboard.py entrada.html [salida.html]
@@ -52,6 +55,34 @@ def detect_category_field(d):
     return None, None
 
 
+COLOR_FIELD_CANDIDATES = ["codigo_color", "color", "hex_color", "map_color"]
+
+
+def detect_explicit_color_field(d, layer_id):
+    """If the layer already carries a per-feature hex color computed in SQL
+    (e.g. codigo_color), prefer that over generating a palette — it's exact,
+    not guessed, and stays correct even if categories/order change later."""
+    layer = d["layers"].get(layer_id, {})
+    fields = layer.get("fields", [])
+    for cand in COLOR_FIELD_CANDIDATES:
+        if cand in fields:
+            return cand
+    return None
+
+
+def build_color_map_from_field(d, layer_id, category_field, color_field):
+    """Build {category_value: hex_color} by reading the real, already-computed
+    color per feature straight from the data — no palette guessing."""
+    layer = d["layers"][layer_id]
+    color_map = {}
+    for feat in layer.get("features", []):
+        cat = feat.get(category_field)
+        col = feat.get(color_field)
+        if cat is not None and col and cat not in color_map:
+            color_map[cat] = col
+    return color_map
+
+
 def build_color_map(d, layer_id, field):
     layer = d["layers"][layer_id]
     values = []
@@ -84,6 +115,46 @@ def patch_category_colors_and_legend(html, field, color_map):
         f"        {js_str(k)}: {js_str(v)}" for k, v in color_map.items()
     ) + "\n      }"
 
+    # 0) make the category colors GLOBAL (not just local to the map's style
+    # function), and add a catColor() helper, so the Chart widget (bars, pie,
+    # lollipop, dot, funnel, treemap...) can use the exact same colors as the
+    # map instead of the plugin's own generic/unordered palette.
+    old_anchor = 'function color(i) { return SERIES[i % SERIES.length]; }'
+    new_anchor = (
+        old_anchor + '\n'
+        f'  var DASH_CATEGORY_FIELD = {js_str(field)};\n'
+        f'  var DASH_CATEGORY_COLORS = {color_js};\n'
+        '  function catColor(cat, i) {\n'
+        '    var c = DASH_CATEGORY_COLORS ? DASH_CATEGORY_COLORS[cat] : null;\n'
+        '    return c || color(i);\n'
+        '  }'
+    )
+    if old_anchor in html and html.count(old_anchor) == 1:
+        html = html.replace(old_anchor, new_anchor, 1)
+        applied.append("global category colors + catColor()")
+
+        # every chart painter that colors bars/points/segments by category and
+        # already distinguishes the selected one uses this exact pattern
+        old_sel = '(d[0] === selKey) ? "var(--muted)" : color(i);'
+        new_sel = '(d[0] === selKey) ? "var(--muted)" : catColor(d[0], i);'
+        n_sel = html.count(old_sel)
+        if n_sel:
+            html = html.replace(old_sel, new_sel)
+            applied.append(f"chart bars/points recolored ({n_sel} painters)")
+
+        # pie/donut: segment fill + legend swatch
+        old_pie1 = 'fill: color(i), stroke: "#ffffff", "stroke-width": 1, cursor: "pointer" });'
+        new_pie1 = 'fill: catColor(d[0], i), stroke: "#ffffff", "stroke-width": 1, cursor: "pointer" });'
+        if old_pie1 in html and html.count(old_pie1) == 1:
+            html = html.replace(old_pie1, new_pie1, 1)
+            applied.append("pie/donut segments recolored")
+
+        old_pie2 = 'fill: color(i) }));'
+        new_pie2 = 'fill: catColor(d[0], i) }));'
+        if old_pie2 in html and html.count(old_pie2) == 1:
+            html = html.replace(old_pie2, new_pie2, 1)
+            applied.append("pie/donut legend swatches recolored")
+
     old_style = (
         '      var col = color(idx);\n'
         '      var gj = L.geoJSON(fc, {\n'
@@ -93,12 +164,10 @@ def patch_category_colors_and_legend(html, field, color_map):
     )
     new_style = (
         '      var col = color(idx);\n'
-        f'      var CATEGORY_FIELD = {js_str(field)};\n'
-        f'      var CATEGORY_COLORS = {color_js};\n'
         '      var gj = L.geoJSON(fc, {\n'
         '        style: function (f) {\n'
-        '          var val = f && f.properties ? f.properties[CATEGORY_FIELD] : null;\n'
-        '          var c = CATEGORY_COLORS[val] || col;\n'
+        '          var val = f && f.properties ? f.properties[DASH_CATEGORY_FIELD] : null;\n'
+        '          var c = (DASH_CATEGORY_COLORS && DASH_CATEGORY_COLORS[val]) || col;\n'
         '          return { color: "#f7f7f7", weight: 1, fillColor: c, fillOpacity: 0.75 };\n'
         '        },'
     )
@@ -123,8 +192,7 @@ def patch_category_colors_and_legend(html, field, color_map):
         '    title.style.fontWeight = "700";\n'
         '    title.style.marginBottom = "6px";\n'
         '    wrap.appendChild(title);\n'
-        f'    var CATEGORY_COLORS = {color_js};\n'
-        '    Object.keys(CATEGORY_COLORS).forEach(function (label) {\n'
+        '    Object.keys(DASH_CATEGORY_COLORS || {}).forEach(function (label) {\n'
         '      var row = el("div", "dash-legend-row");\n'
         '      row.style.display = "flex";\n'
         '      row.style.alignItems = "center";\n'
@@ -134,7 +202,7 @@ def patch_category_colors_and_legend(html, field, color_map):
         '      swatch.style.display = "inline-block";\n'
         '      swatch.style.width = "14px";\n'
         '      swatch.style.height = "14px";\n'
-        '      swatch.style.background = CATEGORY_COLORS[label];\n'
+        '      swatch.style.background = DASH_CATEGORY_COLORS[label];\n'
         '      swatch.style.border = "1px solid #ccc";\n'
         '      var text = el("span", "dash-legend-label", label);\n'
         '      row.appendChild(swatch);\n'
@@ -158,6 +226,126 @@ def patch_category_colors_and_legend(html, field, color_map):
         applied.append("legend widget")
 
     return html, applied
+
+
+def patch_polygon_labels(html, label_field, min_zoom=13):
+    """Agrega etiquetas de texto (permanentes, centradas) sobre cada polígono
+    del mapa, usando el campo indicado. Se ocultan automáticamente por debajo
+    de min_zoom para evitar amontonamiento cuando el mapa está muy alejado."""
+    old = (
+        '        onEachFeature: function (f, lyr) {\n'
+        '          lyr.bindPopup(identifyHtml(layer.fields, f.properties));\n'
+        '        }\n'
+        '      }).addTo(map);'
+    )
+    new = (
+        '        onEachFeature: function (f, lyr) {\n'
+        '          lyr.bindPopup(identifyHtml(layer.fields, f.properties));\n'
+        f'          var labelVal = f.properties ? f.properties[{js_str(label_field)}] : null;\n'
+        '          if (labelVal !== null && labelVal !== undefined && labelVal !== "") {\n'
+        '            lyr.bindTooltip(String(labelVal), {\n'
+        '              permanent: true, direction: "center", className: "dash-poly-label"\n'
+        '            });\n'
+        '          }\n'
+        '        }\n'
+        '      }).addTo(map);'
+    )
+    if old not in html:
+        return html, False
+
+    html = html.replace(old, new, 1)
+
+    # zoom-based show/hide + minimal CSS, injected once right before fitBounds/invalidateSize
+    old2 = (
+        '    map.invalidateSize();\n'
+        '    MAP_INSTANCES.push(map);\n'
+        '  }'
+    )
+    new2 = (
+        '    if (!document.getElementById("dash-poly-label-style")) {\n'
+        '      var lst = document.createElement("style");\n'
+        '      lst.id = "dash-poly-label-style";\n'
+        '      lst.textContent = ".dash-poly-label{background:transparent;border:none;'
+        'box-shadow:none;font-size:11px;font-weight:600;color:#222;'
+        'text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff;}";\n'
+        '      document.head.appendChild(lst);\n'
+        '    }\n'
+        f'    var LABEL_MIN_ZOOM = {min_zoom};\n'
+        '    var updateLabelVisibility = function () {\n'
+        '      var show = map.getZoom() >= LABEL_MIN_ZOOM;\n'
+        '      gjLayers.forEach(function (gl) {\n'
+        '        gl.gj.eachLayer(function (lyr) {\n'
+        '          if (!lyr.getTooltip || !lyr.getTooltip()) return;\n'
+        '          if (show && !lyr.isTooltipOpen()) lyr.openTooltip();\n'
+        '          else if (!show && lyr.isTooltipOpen()) lyr.closeTooltip();\n'
+        '        });\n'
+        '      });\n'
+        '    };\n'
+        '    map.on("zoomend", updateLabelVisibility);\n'
+        '    updateLabelVisibility();\n'
+        '    map.invalidateSize();\n'
+        '    MAP_INSTANCES.push(map);\n'
+        '  }'
+    )
+    if old2 not in html:
+        return html, False
+    html = html.replace(old2, new2, 1)
+    return html, True
+
+
+def patch_map_visual_filter(html):
+    """Hoy el mapa dibuja SIEMPRE todos los polígonos, sin importar qué haya
+    seleccionado un Category selector o un clic en el Chart -- solo esos otros
+    widgets se recalculan. Este parche hace que el propio mapa oculte/muestre
+    polígonos según las selecciones activas que lo tengan como destino."""
+    old_anchor = 'var MAP_INSTANCES = [];  // live L.map objects, torn down on page switch'
+    new_anchor = old_anchor + '''
+
+  function mapPredsFor(tileId, page) {
+    if (!page) return [];
+    var conns = page.connections || {};
+    var sel = selections(page.id);
+    var preds = [];
+    Object.keys(conns).forEach(function (src) {
+      if (Array.isArray(conns[src]) && conns[src].indexOf(tileId) >= 0) {
+        var s = sel[src];
+        if (s && s.pairs && s.pairs.length) preds = preds.concat(s.pairs);
+      }
+    });
+    return preds;
+  }
+
+  function applyMapPreds(layer, preds) {
+    if (!preds.length) return layer;
+    var feats = [], geoms = [];
+    (layer.features || []).forEach(function (r, i) {
+      var ok = preds.every(function (p) {
+        if (p.idxSet) return true;
+        if (p.lo !== undefined) {
+          var n = parseFloat(r[p.field]);
+          return !isNaN(n) && n >= p.lo && n < p.hi;
+        }
+        return String(r[p.field]) === String(p.value);
+      });
+      if (ok) { feats.push(r); geoms.push((layer.geometry || [])[i]); }
+    });
+    return { features: feats, geometry: geoms, fields: layer.fields };
+  }'''
+    if html.count(old_anchor) != 1:
+        return html, False
+    html = html.replace(old_anchor, new_anchor, 1)
+
+    old_fc = '''      var layer = DATA.layers[lid];
+      if (!layer || !layer.geometry) return;
+      var fc = featureCollection(layer);'''
+    new_fc = '''      var layer = DATA.layers[lid];
+      if (!layer || !layer.geometry) return;
+      var preds = mapPredsFor(tile.id, page);
+      var fc = featureCollection(applyMapPreds(layer, preds));'''
+    if html.count(old_fc) != 1:
+        return html, False
+    html = html.replace(old_fc, new_fc, 1)
+    return html, True
 
 
 def patch_extent_filter(html):
@@ -377,7 +565,12 @@ def main():
 
     layer_id, field = detect_category_field(d)
     if layer_id and field:
-        color_map = build_color_map(d, layer_id, field)
+        color_field = detect_explicit_color_field(d, layer_id)
+        if color_field:
+            color_map = build_color_map_from_field(d, layer_id, field, color_field)
+            print(f"  [2/3] Usando color real por feature (campo '{color_field}') en vez de paleta genérica.")
+        else:
+            color_map = build_color_map(d, layer_id, field)
         html, applied_colors = patch_category_colors_and_legend(html, field, color_map)
         print(f"  [2/3] Colores por categoría ('{field}', {len(color_map)} valores) + leyenda: "
               f"{', '.join(applied_colors) if applied_colors else 'no aplicable'}")
@@ -386,10 +579,14 @@ def main():
 
     html, applied_extent = patch_extent_filter(html)
     ok = len(applied_extent) >= 10  # all sub-patches expected
-    print(f"  [3/3] Filtro por pan/zoom del mapa: {'aplicado (' + str(len(applied_extent)) + '/11 pasos)' if applied_extent else 'no aplicable'}")
+    print(f"  [3/4] Filtro por pan/zoom del mapa: {'aplicado (' + str(len(applied_extent)) + '/11 pasos)' if applied_extent else 'no aplicable'}")
     if applied_extent and not ok:
         print(f"        ⚠️  Solo se aplicaron {len(applied_extent)}/11 pasos — revisa manualmente, "
               "puede que el bundle JS de este export difiera del que usamos como referencia.")
+
+    html, map_filter_applied = patch_map_visual_filter(html)
+    print(f"  [4/4] El mapa oculta/muestra polígonos según selección (Category selector, clic en Chart, etc.): "
+          f"{'aplicado' if map_filter_applied else 'no aplicable (revisa que el paso 3 se haya aplicado primero)'}")
 
     # insert idempotency marker right after the dashboard-data script closes
     marker_anchor = '</script>\n<script>'
