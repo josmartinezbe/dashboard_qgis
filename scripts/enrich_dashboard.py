@@ -27,6 +27,8 @@ MARKER = "/* DASH_ENRICHED_V1 */"
 
 FILL_OPACITY = 0.55  # antes 0.75 -- más transparencia para ver mejor el satelital de fondo
 
+LEGEND_TEXT_COLOR = "rgb(255,205,0)"  # amarillo/dorado oficial Terrasos -- título y etiquetas de la leyenda
+
 ESRI_SATELLITE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 ESRI_SATELLITE_ATTRIBUTION = "Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"
 
@@ -75,17 +77,31 @@ def detect_explicit_color_field(d, layer_id):
     return None
 
 
+def natural_key(s):
+    """Ordena '1. ÓPTIMA...', '2. ALTA...' ... numéricamente por el prefijo,
+    en vez de alfabéticamente (que pondría '1.' antes de '10.' pero después
+    de cualquier letra, y mezclaría el orden como vimos en la leyenda)."""
+    s = str(s)
+    m = re.match(r'^\s*(\d+)', s)
+    if m:
+        return (0, int(m.group(1)), s)
+    return (1, 0, s)
+
+
 def build_color_map_from_field(d, layer_id, category_field, color_field):
     """Build {category_value: hex_color} by reading the real, already-computed
-    color per feature straight from the data — no palette guessing."""
+    color per feature straight from the data — no palette guessing. Se ordena
+    con natural_key así el diccionario (y por lo tanto la leyenda, que itera
+    Object.keys() en orden de inserción) sale en orden lógico, no en el orden
+    en que las categorías aparecieron primero en los datos."""
     layer = d["layers"][layer_id]
-    color_map = {}
+    raw = {}
     for feat in layer.get("features", []):
         cat = feat.get(category_field)
         col = feat.get(color_field)
-        if cat is not None and col and cat not in color_map:
-            color_map[cat] = col
-    return color_map
+        if cat is not None and col and cat not in raw:
+            raw[cat] = col
+    return {k: raw[k] for k in sorted(raw.keys(), key=natural_key)}
 
 
 def build_color_map(d, layer_id, field):
@@ -97,7 +113,7 @@ def build_color_map(d, layer_id, field):
         if v is not None and v not in seen:
             seen.add(v)
             values.append(v)
-    values.sort(key=lambda x: str(x))
+    values.sort(key=natural_key)
     return {v: QUALITATIVE_PALETTE[i % len(QUALITATIVE_PALETTE)] for i, v in enumerate(values)}
 
 
@@ -196,6 +212,7 @@ def patch_category_colors_and_legend(html, field, color_map):
         + js_str(field) + ');\n'
         '    title.style.fontWeight = "700";\n'
         '    title.style.marginBottom = "6px";\n'
+        f'    title.style.color = {js_str(LEGEND_TEXT_COLOR)};\n'
         '    wrap.appendChild(title);\n'
         '    Object.keys(DASH_CATEGORY_COLORS || {}).forEach(function (label) {\n'
         '      var row = el("div", "dash-legend-row");\n'
@@ -210,6 +227,7 @@ def patch_category_colors_and_legend(html, field, color_map):
         '      swatch.style.background = DASH_CATEGORY_COLORS[label];\n'
         '      swatch.style.border = "1px solid #ccc";\n'
         '      var text = el("span", "dash-legend-label", label);\n'
+        f'      text.style.color = {js_str(LEGEND_TEXT_COLOR)};\n'
         '      row.appendChild(swatch);\n'
         '      row.appendChild(text);\n'
         '      wrap.appendChild(row);\n'
@@ -233,11 +251,34 @@ def patch_category_colors_and_legend(html, field, color_map):
     return html, applied
 
 
+def patch_indicator_style_color(html):
+    """El plugin SÍ guarda el color que configuras en QGIS para el Indicator
+    (cfg.style.value_color), pero el runtime del export lo ignora y usa el
+    color de acento del tema (var(--accent)) para todos los indicadores por
+    igual. Este parche hace que respete el color que de verdad configuraste."""
+    old = (
+        '    var valNode = el("div", "dash-ind-value");\n'
+        '    if (cfg.value_size) valNode.style.fontSize = cfg.value_size + "px";\n'
+        '    wrap.appendChild(valNode);'
+    )
+    new = (
+        '    var valNode = el("div", "dash-ind-value");\n'
+        '    if (cfg.value_size) valNode.style.fontSize = cfg.value_size + "px";\n'
+        '    if (cfg.style && cfg.style.value_color) valNode.style.color = cfg.style.value_color;\n'
+        '    wrap.appendChild(valNode);'
+    )
+    if old not in html or html.count(old) != 1:
+        return html, False
+    html = html.replace(old, new, 1)
+    return html, True
+
+
 def patch_polygon_labels(html, label_field, min_zoom=13):
-    """Agrega etiquetas de texto (permanentes, centradas) sobre cada polígono
-    del mapa, usando el campo indicado. Se ocultan por debajo de min_zoom para
-    evitar amontonamiento. Usa su propio LABEL_LAYERS (no depende de gjLayers
-    del parche de pan/zoom), así funciona sin importar el orden de aplicación."""
+    """Agrega etiquetas de texto sobre cada polígono del mapa, usando el campo
+    indicado -- pero de forma PEREZOSA: solo crea los tooltips en el DOM
+    cuando el zoom ya es suficiente para verlos, y los destruye al alejar el
+    zoom. Crear miles de tooltips permanentes de una sola vez al cargar (lo
+    que hacía la versión anterior) congela el navegador con capas grandes."""
 
     old_decl = 'var m = tile.map || {};'
     if html.count(old_decl) != 1:
@@ -255,9 +296,7 @@ def patch_polygon_labels(html, label_field, min_zoom=13):
         '          lyr.bindPopup(identifyHtml(layer.fields, f.properties));\n'
         f'          var labelVal = f.properties ? f.properties[{js_str(label_field)}] : null;\n'
         '          if (labelVal !== null && labelVal !== undefined && labelVal !== "") {\n'
-        '            lyr.bindTooltip(String(labelVal), {\n'
-        '              permanent: true, direction: "center", className: "dash-poly-label"\n'
-        '            });\n'
+        '            lyr._dashLabel = String(labelVal);\n'  # cheap: no DOM work yet
         '          }\n'
         '        }\n'
         '      }).addTo(map);\n'
@@ -282,15 +321,27 @@ def patch_polygon_labels(html, label_field, min_zoom=13):
         f'    var LABEL_MIN_ZOOM = {min_zoom};\n'
         '    var updateLabelVisibility = function () {\n'
         '      var show = map.getZoom() >= LABEL_MIN_ZOOM;\n'
+        '      var vb = show ? map.getBounds() : null;\n'
         '      LABEL_LAYERS.forEach(function (glGroup) {\n'
         '        glGroup.eachLayer(function (lyr) {\n'
-        '          if (!lyr.getTooltip || !lyr.getTooltip()) return;\n'
-        '          if (show && !lyr.isTooltipOpen()) lyr.openTooltip();\n'
-        '          else if (!show && lyr.isTooltipOpen()) lyr.closeTooltip();\n'
+        '          if (!lyr._dashLabel) return;\n'
+        '          if (show) {\n'
+        '            var lb = lyr.getBounds ? lyr.getBounds() : null;\n'
+        '            var inView = !lb || vb.intersects(lb);\n'
+        '            if (inView && !lyr.getTooltip()) {\n'
+        '              lyr.bindTooltip(lyr._dashLabel, {\n'
+        '                permanent: true, direction: "center", className: "dash-poly-label"\n'
+        '              });\n'
+        '            } else if (!inView && lyr.getTooltip()) {\n'
+        '              lyr.unbindTooltip();\n'
+        '            }\n'
+        '          } else if (lyr.getTooltip()) {\n'
+        '            lyr.unbindTooltip();\n'
+        '          }\n'
         '        });\n'
         '      });\n'
         '    };\n'
-        '    map.on("zoomend", updateLabelVisibility);\n'
+        '    map.on("zoomend moveend", updateLabelVisibility);\n'
         '    updateLabelVisibility();\n'
         '    var ext = m.extent;'
     )
@@ -676,51 +727,55 @@ def main():
     html, d, sat_applied = patch_satellite_basemap(
         html, start2, end, d, ESRI_SATELLITE_URL, ESRI_SATELLITE_ATTRIBUTION
     )
-    print(f"  [0/7] Basemap satelital (Esri World Imagery): {'aplicado' if sat_applied else 'no aplicable (no se encontró ningún tile de mapa)'}")
+    print(f"  [0/8] Basemap satelital (Esri World Imagery): {'aplicado' if sat_applied else 'no aplicable (no se encontró ningún tile de mapa)'}")
 
     html, fixed_conn = patch_connections_guard(html)
-    print(f"  [1/7] Fix connections array/objeto: {'aplicado' if fixed_conn else 'no aplicable (patrón no encontrado)'}")
+    print(f"  [1/8] Fix connections array/objeto: {'aplicado' if fixed_conn else 'no aplicable (patrón no encontrado)'}")
 
     layer_id, field = detect_category_field(d)
     if layer_id and field:
         color_field = detect_explicit_color_field(d, layer_id)
         if color_field:
             color_map = build_color_map_from_field(d, layer_id, field, color_field)
-            print(f"  [2/7] Usando color real por feature (campo '{color_field}') en vez de paleta genérica.")
+            print(f"  [2/8] Usando color real por feature (campo '{color_field}') en vez de paleta genérica.")
         else:
             color_map = build_color_map(d, layer_id, field)
         html, applied_colors = patch_category_colors_and_legend(html, field, color_map)
-        print(f"  [2/7] Colores por categoría ('{field}', {len(color_map)} valores, opacidad {FILL_OPACITY}) + leyenda: "
+        print(f"  [2/8] Colores por categoría ('{field}', {len(color_map)} valores, opacidad {FILL_OPACITY}) + leyenda: "
               f"{', '.join(applied_colors) if applied_colors else 'no aplicable'}")
     else:
         color_map = {}
-        print("  [2/7] No se encontró ningún Chart/Category selector con category_field -> se omite este paso.")
+        print("  [2/8] No se encontró ningún Chart/Category selector con category_field -> se omite este paso.")
 
     html, applied_extent = patch_extent_filter(html)
     ok = len(applied_extent) >= 10  # all sub-patches expected
-    print(f"  [3/7] Filtro por pan/zoom del mapa: {'aplicado (' + str(len(applied_extent)) + '/11 pasos)' if applied_extent else 'no aplicable'}")
+    print(f"  [3/8] Filtro por pan/zoom del mapa: {'aplicado (' + str(len(applied_extent)) + '/11 pasos)' if applied_extent else 'no aplicable'}")
     if applied_extent and not ok:
         print(f"        ⚠️  Solo se aplicaron {len(applied_extent)}/11 pasos — revisa manualmente, "
               "puede que el bundle JS de este export difiera del que usamos como referencia.")
 
     html, map_filter_applied = patch_map_visual_filter(html)
-    print(f"  [4/7] El mapa oculta/muestra polígonos según selección: "
+    print(f"  [4/8] El mapa oculta/muestra polígonos según selección: "
           f"{'aplicado' if map_filter_applied else 'no aplicable (revisa que el paso 3 se haya aplicado primero)'}")
 
     # etiquetas: por defecto usa el campo 'id' si existe en la capa detectada arriba
     label_applied = False
     if layer_id and "id" in d["layers"].get(layer_id, {}).get("fields", []):
         html, label_applied = patch_polygon_labels(html, "id")
-    print(f"  [5/7] Etiquetas 'id' sobre los polígonos: "
+    print(f"  [5/8] Etiquetas 'id' sobre los polígonos: "
           f"{'aplicado' if label_applied else 'no aplicable (revisa que el paso 3 se haya aplicado primero, o que exista el campo id)'}")
 
     html, controls_applied = patch_map_controls(html)
-    print(f"  [6/7] Panel de controles (mapa base + transparencia): "
+    print(f"  [6/8] Panel de controles (mapa base + transparencia): "
           f"{'aplicado' if controls_applied else 'no aplicable (revisa que el paso 3 se haya aplicado primero)'}")
 
     html, sort_applied = patch_selector_numeric_sort(html)
-    print(f"  [7/7] Orden numérico en el desplegable del Category selector: "
+    print(f"  [7/8] Orden numérico en el desplegable del Category selector: "
           f"{'aplicado' if sort_applied else 'no aplicable (patrón no encontrado)'}")
+
+    html, ind_color_applied = patch_indicator_style_color(html)
+    print(f"  [8/8] Indicator respeta el color configurado en QGIS (value_color): "
+          f"{'aplicado' if ind_color_applied else 'no aplicable (patrón no encontrado)'}")
 
     # insert idempotency marker right after the dashboard-data script closes
     marker_anchor = '</script>\n<script>'
