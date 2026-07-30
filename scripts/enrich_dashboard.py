@@ -25,6 +25,11 @@ import re
 
 MARKER = "/* DASH_ENRICHED_V1 */"
 
+FILL_OPACITY = 0.55  # antes 0.75 -- más transparencia para ver mejor el satelital de fondo
+
+ESRI_SATELLITE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+ESRI_SATELLITE_ATTRIBUTION = "Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"
+
 QUALITATIVE_PALETTE = [
     "rgb(215,25,28)", "rgb(43,131,186)", "rgb(230,200,60)",
     "rgb(26,150,65)", "rgb(148,103,189)", "rgb(255,127,0)",
@@ -168,7 +173,7 @@ def patch_category_colors_and_legend(html, field, color_map):
         '        style: function (f) {\n'
         '          var val = f && f.properties ? f.properties[DASH_CATEGORY_FIELD] : null;\n'
         '          var c = (DASH_CATEGORY_COLORS && DASH_CATEGORY_COLORS[val]) || col;\n'
-        '          return { color: "#f7f7f7", weight: 1, fillColor: c, fillOpacity: 0.75 };\n'
+        '          return { color: "#f7f7f7", weight: 1, fillColor: c, fillOpacity: ' + str(FILL_OPACITY) + ' };\n'
         '        },'
     )
     if old_style in html:
@@ -230,8 +235,15 @@ def patch_category_colors_and_legend(html, field, color_map):
 
 def patch_polygon_labels(html, label_field, min_zoom=13):
     """Agrega etiquetas de texto (permanentes, centradas) sobre cada polígono
-    del mapa, usando el campo indicado. Se ocultan automáticamente por debajo
-    de min_zoom para evitar amontonamiento cuando el mapa está muy alejado."""
+    del mapa, usando el campo indicado. Se ocultan por debajo de min_zoom para
+    evitar amontonamiento. Usa su propio LABEL_LAYERS (no depende de gjLayers
+    del parche de pan/zoom), así funciona sin importar el orden de aplicación."""
+
+    old_decl = 'var m = tile.map || {};'
+    if html.count(old_decl) != 1:
+        return html, False
+    html = html.replace(old_decl, old_decl + '\n    var LABEL_LAYERS = [];', 1)
+
     old = (
         '        onEachFeature: function (f, lyr) {\n'
         '          lyr.bindPopup(identifyHtml(layer.fields, f.properties));\n'
@@ -248,19 +260,16 @@ def patch_polygon_labels(html, label_field, min_zoom=13):
         '            });\n'
         '          }\n'
         '        }\n'
-        '      }).addTo(map);'
+        '      }).addTo(map);\n'
+        '      LABEL_LAYERS.push(gj);'
     )
     if old not in html:
         return html, False
-
     html = html.replace(old, new, 1)
 
-    # zoom-based show/hide + minimal CSS, injected once right before fitBounds/invalidateSize
-    old2 = (
-        '    map.invalidateSize();\n'
-        '    MAP_INSTANCES.push(map);\n'
-        '  }'
-    )
+    old2 = '    var ext = m.extent;'
+    if html.count(old2) != 1:
+        return html, False
     new2 = (
         '    if (!document.getElementById("dash-poly-label-style")) {\n'
         '      var lst = document.createElement("style");\n'
@@ -273,8 +282,8 @@ def patch_polygon_labels(html, label_field, min_zoom=13):
         f'    var LABEL_MIN_ZOOM = {min_zoom};\n'
         '    var updateLabelVisibility = function () {\n'
         '      var show = map.getZoom() >= LABEL_MIN_ZOOM;\n'
-        '      gjLayers.forEach(function (gl) {\n'
-        '        gl.gj.eachLayer(function (lyr) {\n'
+        '      LABEL_LAYERS.forEach(function (glGroup) {\n'
+        '        glGroup.eachLayer(function (lyr) {\n'
         '          if (!lyr.getTooltip || !lyr.getTooltip()) return;\n'
         '          if (show && !lyr.isTooltipOpen()) lyr.openTooltip();\n'
         '          else if (!show && lyr.isTooltipOpen()) lyr.closeTooltip();\n'
@@ -283,13 +292,49 @@ def patch_polygon_labels(html, label_field, min_zoom=13):
         '    };\n'
         '    map.on("zoomend", updateLabelVisibility);\n'
         '    updateLabelVisibility();\n'
-        '    map.invalidateSize();\n'
-        '    MAP_INSTANCES.push(map);\n'
-        '  }'
+        '    var ext = m.extent;'
     )
-    if old2 not in html:
-        return html, False
     html = html.replace(old2, new2, 1)
+    return html, True
+
+
+def patch_satellite_basemap(html, start2, end, d, url_template, attribution, max_zoom=19):
+    """Cambia el basemap de todos los tiles de mapa a imágenes satelitales
+    (o cualquier tile server que le pases), editando directamente el JSON
+    embebido -- no hace falta tocar el runtime JS para esto."""
+    changed = False
+    for page in d.get("pages", []):
+        for t in page.get("tiles", []):
+            if t.get("type") == "map":
+                m = t.setdefault("map", {})
+                bm = m.setdefault("basemap", {})
+                bm["url_template"] = url_template
+                bm["attribution"] = attribution
+                bm["max_zoom"] = max_zoom
+                changed = True
+    if not changed:
+        return html, d, False
+    new_json = json.dumps(d, ensure_ascii=False)
+    html = html[:start2] + new_json + html[end:]
+    return html, d, True
+
+
+def patch_selector_numeric_sort(html):
+    """El <select> del Category selector ordena las opciones con .sort() por
+    defecto, que es orden de TEXTO (1, 12, 13, 2, 3...). Lo cambia a un orden
+    natural: numérico cuando el valor es un número, alfabético si no."""
+    old = 'Object.keys(seen).sort().forEach(function (v) { select.appendChild(new Option(v, v)); });'
+    new = (
+        'Object.keys(seen).sort(function (a, b) {\n'
+        '        var na = Number(a), nb = Number(b);\n'
+        '        var an = a !== "" && !isNaN(na), bn = b !== "" && !isNaN(nb);\n'
+        '        if (an && bn) return na - nb;\n'
+        '        return a < b ? -1 : (a > b ? 1 : 0);\n'
+        '      }).forEach(function (v) { select.appendChild(new Option(v, v)); });'
+    )
+    if old not in html or html.count(old) != 1:
+        return html, False
+    html = html.replace(old, new, 1)
     return html, True
 
 
@@ -345,6 +390,73 @@ def patch_map_visual_filter(html):
     if html.count(old_fc) != 1:
         return html, False
     html = html.replace(old_fc, new_fc, 1)
+    return html, True
+
+
+def patch_map_controls(html):
+    """Agrega un panel flotante sobre el mapa con: (1) selector de mapa base
+    (Satelital/Calles/Claro/Topográfico) y (2) control deslizante de
+    transparencia de los polígonos."""
+    old_tile = '''    L.tileLayer(bm.url_template ||
+      "https://tile.openstreetmap.org/{z}/{x}/{y}.png", opts).addTo(map);'''
+    new_tile = '''    var baseLayer = L.tileLayer(bm.url_template ||
+      "https://tile.openstreetmap.org/{z}/{x}/{y}.png", opts).addTo(map);'''
+    if html.count(old_tile) != 1:
+        return html, False
+    html = html.replace(old_tile, new_tile, 1)
+
+    old_anchor = '    var ext = m.extent;'
+    if html.count(old_anchor) != 1:
+        return html, False
+    new_anchor = '''    (function () {
+      var BASEMAP_OPTIONS = [
+        { label: "Satelital (Esri)", url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", attribution: "Tiles &copy; Esri" },
+        { label: "Calles (OSM)", url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png", attribution: "&copy; OpenStreetMap contributors" },
+        { label: "Claro (Carto)", url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", attribution: "&copy; OpenStreetMap contributors &copy; CARTO" },
+        { label: "Topogr\\u00e1fico (Esri)", url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}", attribution: "Tiles &copy; Esri" }
+      ];
+      if (!document.getElementById("dash-map-controls-style")) {
+        var st = document.createElement("style");
+        st.id = "dash-map-controls-style";
+        st.textContent = ".dash-map-controls{position:absolute;top:8px;right:8px;z-index:1000;" +
+          "background:rgba(255,255,255,.92);border:1px solid #d7dbe0;border-radius:8px;padding:8px 10px;" +
+          "font-size:11px;font-family:inherit;box-shadow:0 1px 4px rgba(0,0,0,.15);display:flex;flex-direction:column;gap:6px;min-width:150px;}" +
+          ".dash-map-controls label{font-weight:600;color:#333;margin-bottom:2px;display:block;}" +
+          ".dash-map-controls select,.dash-map-controls input[type=range]{width:100%;box-sizing:border-box;}";
+        document.head.appendChild(st);
+      }
+      var panel = document.createElement("div");
+      panel.className = "dash-map-controls";
+      panel.innerHTML =
+        '<div><label>Mapa base</label><select class="dash-basemap-select"></select></div>' +
+        '<div><label>Transparencia</label><input type="range" class="dash-opacity-range" min="0" max="100" value="''' + str(int(FILL_OPACITY * 100)) + '''"></div>';
+      host.appendChild(panel);
+
+      var sel = panel.querySelector(".dash-basemap-select");
+      BASEMAP_OPTIONS.forEach(function (opt, oi) {
+        var o = document.createElement("option");
+        o.value = String(oi);
+        o.textContent = opt.label;
+        if (opt.url === (bm.url_template || "")) o.selected = true;
+        sel.appendChild(o);
+      });
+      sel.addEventListener("change", function () {
+        var opt = BASEMAP_OPTIONS[Number(sel.value)];
+        if (!opt) return;
+        map.removeLayer(baseLayer);
+        baseLayer = L.tileLayer(opt.url, { maxZoom: bm.max_zoom || 19, attribution: opt.attribution }).addTo(map);
+        baseLayer.bringToBack();
+      });
+
+      var range = panel.querySelector(".dash-opacity-range");
+      range.addEventListener("input", function () {
+        var v = Number(range.value) / 100;
+        gjLayers.forEach(function (gl) { gl.gj.setStyle({ fillOpacity: v }); });
+      });
+    })();
+
+    var ext = m.extent;'''
+    html = html.replace(old_anchor, new_anchor, 1)
     return html, True
 
 
@@ -553,40 +665,62 @@ def main():
         print(f"Copiado sin cambios a: {out_path}")
         return
 
-    d, _, _ = load_dashboard_json(html)
+    d, start2, end = load_dashboard_json(html)
     if d is None:
         print("No parece un export de QGIS Dashboards (no se encontró dashboard-data). Abortando.")
         sys.exit(1)
 
     print(f"Analizando: {in_path}")
 
+    # 0) basemap satelital -- se hace primero porque reescribe el bloque JSON completo
+    html, d, sat_applied = patch_satellite_basemap(
+        html, start2, end, d, ESRI_SATELLITE_URL, ESRI_SATELLITE_ATTRIBUTION
+    )
+    print(f"  [0/7] Basemap satelital (Esri World Imagery): {'aplicado' if sat_applied else 'no aplicable (no se encontró ningún tile de mapa)'}")
+
     html, fixed_conn = patch_connections_guard(html)
-    print(f"  [1/3] Fix connections array/objeto: {'aplicado' if fixed_conn else 'no aplicable (patrón no encontrado)'}")
+    print(f"  [1/7] Fix connections array/objeto: {'aplicado' if fixed_conn else 'no aplicable (patrón no encontrado)'}")
 
     layer_id, field = detect_category_field(d)
     if layer_id and field:
         color_field = detect_explicit_color_field(d, layer_id)
         if color_field:
             color_map = build_color_map_from_field(d, layer_id, field, color_field)
-            print(f"  [2/3] Usando color real por feature (campo '{color_field}') en vez de paleta genérica.")
+            print(f"  [2/7] Usando color real por feature (campo '{color_field}') en vez de paleta genérica.")
         else:
             color_map = build_color_map(d, layer_id, field)
         html, applied_colors = patch_category_colors_and_legend(html, field, color_map)
-        print(f"  [2/3] Colores por categoría ('{field}', {len(color_map)} valores) + leyenda: "
+        print(f"  [2/7] Colores por categoría ('{field}', {len(color_map)} valores, opacidad {FILL_OPACITY}) + leyenda: "
               f"{', '.join(applied_colors) if applied_colors else 'no aplicable'}")
     else:
-        print("  [2/3] No se encontró ningún Chart/Category selector con category_field -> se omite este paso.")
+        color_map = {}
+        print("  [2/7] No se encontró ningún Chart/Category selector con category_field -> se omite este paso.")
 
     html, applied_extent = patch_extent_filter(html)
     ok = len(applied_extent) >= 10  # all sub-patches expected
-    print(f"  [3/4] Filtro por pan/zoom del mapa: {'aplicado (' + str(len(applied_extent)) + '/11 pasos)' if applied_extent else 'no aplicable'}")
+    print(f"  [3/7] Filtro por pan/zoom del mapa: {'aplicado (' + str(len(applied_extent)) + '/11 pasos)' if applied_extent else 'no aplicable'}")
     if applied_extent and not ok:
         print(f"        ⚠️  Solo se aplicaron {len(applied_extent)}/11 pasos — revisa manualmente, "
               "puede que el bundle JS de este export difiera del que usamos como referencia.")
 
     html, map_filter_applied = patch_map_visual_filter(html)
-    print(f"  [4/4] El mapa oculta/muestra polígonos según selección (Category selector, clic en Chart, etc.): "
+    print(f"  [4/7] El mapa oculta/muestra polígonos según selección: "
           f"{'aplicado' if map_filter_applied else 'no aplicable (revisa que el paso 3 se haya aplicado primero)'}")
+
+    # etiquetas: por defecto usa el campo 'id' si existe en la capa detectada arriba
+    label_applied = False
+    if layer_id and "id" in d["layers"].get(layer_id, {}).get("fields", []):
+        html, label_applied = patch_polygon_labels(html, "id")
+    print(f"  [5/7] Etiquetas 'id' sobre los polígonos: "
+          f"{'aplicado' if label_applied else 'no aplicable (revisa que el paso 3 se haya aplicado primero, o que exista el campo id)'}")
+
+    html, controls_applied = patch_map_controls(html)
+    print(f"  [6/7] Panel de controles (mapa base + transparencia): "
+          f"{'aplicado' if controls_applied else 'no aplicable (revisa que el paso 3 se haya aplicado primero)'}")
+
+    html, sort_applied = patch_selector_numeric_sort(html)
+    print(f"  [7/7] Orden numérico en el desplegable del Category selector: "
+          f"{'aplicado' if sort_applied else 'no aplicable (patrón no encontrado)'}")
 
     # insert idempotency marker right after the dashboard-data script closes
     marker_anchor = '</script>\n<script>'
